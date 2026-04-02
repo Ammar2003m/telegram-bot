@@ -1,0 +1,531 @@
+"""
+نظام الدفع المباشر — شراء الآن
+يُفعَّل عند عدم توفر رصيد الزبون الكافي
+"""
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import (
+    CallbackQueryHandler, MessageHandler, ConversationHandler,
+    ContextTypes, filters,
+)
+
+from config import ADMIN_ID, CURRENCY_SYMBOLS
+from db import get_user, get_balance, create_order, update_order_status, convert_from_usd
+from keyboards import back, make_btn as MB
+from .payments import PAYMENTS, COUNTRY_LABEL, COUNTRY_FLAG, COUNTRY_CURRENCY
+
+SEP  = "━━━━━━━━━━━━━━━"
+SEP2 = "───────────────"
+
+# ── حالات المحادثة ─────────────────────────────────
+DP_COUNTRY = 0
+DP_METHOD  = 1
+DP_RECEIPT = 2
+
+_DP_KEY = "__dp_ctx__"
+
+
+# ════════════════════════════════════════════════════
+#  أدوات مساعدة قابلة للاستيراد
+# ════════════════════════════════════════════════════
+
+def set_dp_ctx(ctx: ContextTypes.DEFAULT_TYPE, *,
+               svc: str, label: str, usd: float, back_cb: str = "gsm"):
+    """يحفظ سياق الشراء المباشر في user_data."""
+    ctx.user_data[_DP_KEY] = {
+        "svc":     svc,
+        "label":   label,
+        "usd":     usd,
+        "back_cb": back_cb,
+    }
+
+
+def insufficient_kb(back_cb: str = "gsm") -> InlineKeyboardMarkup:
+    """يُرجع لوحة مفاتيح 'رصيد غير كافٍ' الجديدة."""
+    return InlineKeyboardMarkup([
+        [
+            MB("🛒 شراء الآن",  "direct_pay", "btn_buy_now"),
+            MB("💳 شحن رصيدي", "deposit",     "btn_charge"),
+        ],
+        [MB("⬅️ رجوع", back_cb, "btn_back")],
+    ])
+
+
+def insufficient_text(balance: float, usd: float,
+                       currency: str, sym: str) -> str:
+    """نص رسالة 'رصيد غير كافٍ'."""
+    return (
+        f"❌ <b>رصيدك غير كافٍ</b>\n\n"
+        f"💰 رصيدك: <b>{convert_from_usd(balance, currency):.2f} {sym}</b>\n"
+        f"💲 المطلوب: <b>{convert_from_usd(usd, currency):.2f} {sym}</b>\n\n"
+        f"كيف تفضل طريقة الدفع؟"
+    )
+
+
+async def show_insufficient(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    usd: float,
+    label: str,
+    svc: str,
+    back_cb: str = "gsm",
+    bot_edit_fn=None,       # دالة _bot_edit الخاصة بـ gsm إن وُجدت
+):
+    """
+    يُعرض رسالة 'رصيدك غير كافٍ' ويحفظ السياق للدفع المباشر.
+    يدعم: q.edit_message_text  ،  update.message.reply_text  ،  _bot_edit
+    """
+    uid      = update.effective_user.id
+    user     = get_user(uid)
+    currency = user["currency"] if user else "USD"
+    sym      = CURRENCY_SYMBOLS.get(currency, currency)
+    balance  = get_balance(uid)
+
+    set_dp_ctx(ctx, svc=svc, label=label, usd=usd, back_cb=back_cb)
+
+    text = insufficient_text(balance, usd, currency, sym)
+    kb   = insufficient_kb(back_cb)
+
+    if bot_edit_fn is not None:
+        await bot_edit_fn(ctx, uid, text, reply_markup=kb)
+    elif update.callback_query:
+        try:
+            await update.callback_query.edit_message_text(
+                text, parse_mode="HTML", reply_markup=kb
+            )
+        except Exception:
+            await update.effective_message.reply_text(
+                text, parse_mode="HTML", reply_markup=kb
+            )
+    else:
+        await update.effective_message.reply_text(
+            text, parse_mode="HTML", reply_markup=kb
+        )
+
+
+# ════════════════════════════════════════════════════
+#  اختيار الدولة
+# ════════════════════════════════════════════════════
+
+def _countries_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            MB("🇾🇪 اليمن",           "dp_ctr_yemen",  "btn_dep_yemen"),
+            MB("🇸🇦 السعودية",        "dp_ctr_ksa",    "btn_dep_saudi"),
+        ],
+        [
+            MB("🇪🇬 مصر",             "dp_ctr_egypt",  "btn_dep_egypt"),
+            MB("💲 عملات رقمية",      "dp_ctr_crypto", "btn_dep_crypto"),
+        ],
+        [MB("⭐ نجوم تيليجرام",       "dp_ctr_stars",  "btn_dep_stars")],
+        [MB("⬅️ رجوع",               "back_to_dp_src", "btn_back")],
+    ])
+
+
+async def direct_pay_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Entry: عرض شاشة اختيار الدولة."""
+    q = update.callback_query
+    await q.answer()
+
+    dp = ctx.user_data.get(_DP_KEY, {})
+    if not dp:
+        await q.edit_message_text(
+            "❌ انتهت الجلسة، ابدأ من جديد.",
+            reply_markup=back("main_menu"),
+        )
+        return ConversationHandler.END
+
+    uid      = q.from_user.id
+    user     = get_user(uid)
+    currency = user["currency"] if user else "USD"
+    sym      = CURRENCY_SYMBOLS.get(currency, currency)
+    price    = convert_from_usd(dp["usd"], currency)
+
+    ctx.user_data["dp_currency"] = currency
+    ctx.user_data["dp_sym"]      = sym
+
+    await q.edit_message_text(
+        f"{SEP}\n"
+        f"🛒 <b>شراء الآن — اختر طريقة الدفع</b>\n"
+        f"{SEP2}\n"
+        f"📦 الخدمة: <b>{dp['label']}</b>\n"
+        f"💲 المبلغ: <b>{price:.2f} {sym}</b>\n\n"
+        f"اختر دولتك لعرض تفاصيل الدفع:",
+        parse_mode="HTML",
+        reply_markup=_countries_kb(),
+    )
+    return DP_COUNTRY
+
+
+async def dp_back_to_source(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """زر رجوع → يعود للرسالة التي ظهرت منها."""
+    q = update.callback_query
+    await q.answer()
+    dp  = ctx.user_data.get(_DP_KEY, {})
+    uid = q.from_user.id
+    user     = get_user(uid)
+    currency = user["currency"] if user else "USD"
+    sym      = CURRENCY_SYMBOLS.get(currency, currency)
+    balance  = get_balance(uid)
+    usd      = dp.get("usd", 0)
+    label    = dp.get("label", "خدمة")
+    svc      = dp.get("svc", "")
+    back_cb  = dp.get("back_cb", "gsm")
+
+    text = insufficient_text(balance, usd, currency, sym)
+    kb   = insufficient_kb(back_cb)
+    await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+    return ConversationHandler.END
+
+
+# ════════════════════════════════════════════════════
+#  اختيار طريقة الدفع
+# ════════════════════════════════════════════════════
+
+async def dp_country(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """اختيار الدولة → عرض طرق الدفع."""
+    q = update.callback_query
+    await q.answer()
+
+    country = q.data.replace("dp_ctr_", "")
+    dp      = ctx.user_data.get(_DP_KEY, {})
+    usd     = dp.get("usd", 0)
+    label   = dp.get("label", "")
+
+    # ── نجوم تيليجرام — مسار الدعم ──
+    if country == "stars":
+        await q.edit_message_text(
+            f"{SEP}\n"
+            f"⭐ <b>الدفع بنجوم تيليجرام</b>\n"
+            f"{SEP2}\n"
+            f"📦 الخدمة: <b>{label}</b>\n\n"
+            f"تواصل مع الدعم وأرسل:\n"
+            f"• اسم الخدمة\n"
+            f"• رقم التحويل (نجوم)\n"
+            f"سيتم تفعيل طلبك فور التأكيد.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🛟 تواصل مع الدعم", callback_data="support")],
+                [MB("⬅️ رجوع", "direct_pay", "btn_back")],
+            ]),
+        )
+        return DP_COUNTRY
+
+    currency = COUNTRY_CURRENCY.get(country, "USD")
+    sym      = CURRENCY_SYMBOLS.get(currency, currency)
+    price    = convert_from_usd(usd, currency)
+    flag     = COUNTRY_FLAG.get(country, "🌐")
+    clabel   = COUNTRY_LABEL.get(country, country)
+
+    ctx.user_data["dp_country"]  = country
+    ctx.user_data["dp_currency"] = currency
+    ctx.user_data["dp_sym"]      = sym
+
+    methods = PAYMENTS.get(country, {})
+    if not methods:
+        await q.answer("⚠️ لا توجد طرق دفع لهذه الدولة", show_alert=True)
+        return DP_COUNTRY
+
+    rows = [
+        [MB(info["name"], f"dp_method_{country}_{key}", info["btn_key"])]
+        for key, info in methods.items()
+        if not info.get("cryptopay")   # CryptoPay يحتاج تعاملاً خاصاً
+    ]
+    rows.append([MB("⬅️ رجوع", "direct_pay", "btn_back")])
+
+    await q.edit_message_text(
+        f"{flag} <b>{clabel}</b>\n\n"
+        f"📦 الخدمة: <b>{label}</b>\n"
+        f"💲 المبلغ المطلوب: <b>{price:.2f} {sym}</b>\n\n"
+        f"اختر طريقة الدفع:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+    return DP_METHOD
+
+
+# ════════════════════════════════════════════════════
+#  عرض تفاصيل الدفع وطلب الإيصال
+# ════════════════════════════════════════════════════
+
+async def dp_method(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """اختيار الطريقة → عرض التفاصيل + طلب صورة التحويل."""
+    q = update.callback_query
+    await q.answer()
+
+    raw            = q.data[len("dp_method_"):]
+    country, mkey  = raw.split("_", 1)
+
+    dp        = ctx.user_data.get(_DP_KEY, {})
+    usd       = dp.get("usd", 0)
+    label     = dp.get("label", "")
+    currency  = COUNTRY_CURRENCY.get(country, "USD")
+    sym       = CURRENCY_SYMBOLS.get(currency, currency)
+    price     = convert_from_usd(usd, currency)
+    flag      = COUNTRY_FLAG.get(country, "🌐")
+    clabel    = COUNTRY_LABEL.get(country, country)
+
+    info      = PAYMENTS.get(country, {}).get(mkey, {})
+    method_nm = info.get("name", mkey)
+    details   = info.get("text", "")
+
+    ctx.user_data["dp_country"]   = country
+    ctx.user_data["dp_method_key"]= mkey
+    ctx.user_data["dp_method_nm"] = method_nm
+    ctx.user_data["dp_price"]     = price
+    ctx.user_data["dp_currency"]  = currency
+    ctx.user_data["dp_sym"]       = sym
+
+    await q.edit_message_text(
+        f"{SEP}\n"
+        f"💳 <b>تفاصيل الدفع</b>\n"
+        f"{SEP2}\n"
+        f"📦 الخدمة: <b>{label}</b>\n"
+        f"💲 المبلغ: <b>{price:.2f} {sym}</b>\n"
+        f"🏦 الطريقة: <b>{method_nm}</b>\n"
+        f"{flag} <b>{clabel}</b>\n"
+        f"{SEP2}\n"
+        f"{details}\n"
+        f"{SEP}\n\n"
+        f"📸 <b>أرسل صورة التحويل بعد إتمامه:</b>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [MB("⬅️ رجوع", f"dp_ctr_{country}", "btn_back")],
+        ]),
+    )
+    return DP_RECEIPT
+
+
+# ════════════════════════════════════════════════════
+#  استقبال الإيصال وإرسال الطلب للأدمن
+# ════════════════════════════════════════════════════
+
+async def dp_receipt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """استقبال صورة الإيصال وإشعار الأدمن."""
+    msg = update.message
+    uid = msg.from_user.id
+
+    if not (msg.photo or msg.document):
+        await msg.reply_text(
+            "📸 الرجاء إرسال <b>صورة</b> الإيصال فقط.",
+            parse_mode="HTML",
+        )
+        return DP_RECEIPT
+
+    dp         = ctx.user_data.get(_DP_KEY, {})
+    label      = dp.get("label", "—")
+    usd        = dp.get("usd", 0)
+    svc        = dp.get("svc", "direct_pay")
+    country    = ctx.user_data.get("dp_country", "—")
+    method_nm  = ctx.user_data.get("dp_method_nm", "—")
+    price      = ctx.user_data.get("dp_price", 0)
+    currency   = ctx.user_data.get("dp_currency", "USD")
+    sym        = ctx.user_data.get("dp_sym", "$")
+    clabel     = COUNTRY_LABEL.get(country, country)
+    flag       = COUNTRY_FLAG.get(country, "🌐")
+
+    user     = get_user(uid)
+    user     = dict(user) if user else {}
+    fname    = user.get("first_name") or "—"
+    username = f"@{user['username']}" if user.get("username") else "—"
+
+    # إنشاء طلب معلّق
+    order_id = create_order(uid, f"{svc}", label, usd)
+
+    caption = (
+        f"{SEP}\n"
+        f"🔔 <b>طلب دفع مباشر جديد</b>\n"
+        f"{SEP2}\n"
+        f"👤 العميل: <b>{fname}</b> ({username})\n"
+        f"🆔 UID: <code>{uid}</code>\n"
+        f"{SEP2}\n"
+        f"📦 الخدمة: <b>{label}</b>\n"
+        f"💲 المبلغ: <b>{price:.2f} {sym}</b> (~{usd:.2f}$)\n"
+        f"🌐 الدولة: {flag} <b>{clabel}</b>\n"
+        f"🏦 الطريقة: <b>{method_nm}</b>\n"
+        f"📋 رقم الطلب: <code>#{order_id}</code>\n"
+        f"{SEP}"
+    )
+
+    admin_kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ تأكيد التحويل", callback_data=f"dp_ok_{order_id}_{uid}"),
+            InlineKeyboardButton("❌ رفض",           callback_data=f"dp_no_{order_id}_{uid}"),
+        ]
+    ])
+
+    # إرسال الأدمن
+    try:
+        if msg.photo:
+            await msg.get_bot().send_photo(
+                ADMIN_ID, msg.photo[-1].file_id,
+                caption=caption, parse_mode="HTML", reply_markup=admin_kb,
+            )
+        else:
+            await msg.get_bot().send_document(
+                ADMIN_ID, msg.document.file_id,
+                caption=caption, parse_mode="HTML", reply_markup=admin_kb,
+            )
+    except Exception as e:
+        import logging
+        logging.warning("direct_pay: فشل إشعار الأدمن: %s", e)
+
+    # إشعار العميل
+    await msg.reply_text(
+        f"✅ <b>تم استلام طلبك!</b>\n\n"
+        f"📦 الخدمة: <b>{label}</b>\n"
+        f"📋 رقم الطلب: <code>#{order_id}</code>\n\n"
+        f"⏳ جاري مراجعة التحويل من قبل الإدارة.\n"
+        f"سيتم إرسال الخدمة فور التأكيد ✅",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [MB("📋 طلباتي",          "my_orders", "btn_orders")],
+            [MB("⬅️ القائمة الرئيسية", "main_menu", "btn_back_main")],
+        ]),
+    )
+
+    _dp_cleanup(ctx)
+    return ConversationHandler.END
+
+
+def _dp_cleanup(ctx):
+    for k in ("dp_country", "dp_method_key", "dp_method_nm",
+              "dp_price", "dp_currency", "dp_sym", _DP_KEY):
+        ctx.user_data.pop(k, None)
+
+
+# ════════════════════════════════════════════════════
+#  معالجات قرارات الأدمن
+# ════════════════════════════════════════════════════
+
+async def dp_admin_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """الأدمن يؤكد التحويل."""
+    q = update.callback_query
+    await q.answer("✅ تم التأكيد")
+
+    _, _, oid_s, cuid_s = q.data.split("_", 3)
+    order_id = int(oid_s)
+    cust_uid = int(cuid_s)
+
+    from db import get_order, remove_total_balance
+
+order = get_order(order_id)
+if not order:
+    await q.answer("❌ الطلب غير موجود", show_alert=True)
+    return
+
+if order["status"] == "completed":
+    await q.answer("⚠️ الطلب منفذ مسبقاً", show_alert=True)
+    return
+
+amount = float(order["amount"])
+
+try:
+    ok = remove_total_balance(cust_uid, amount)
+except Exception:
+    await q.answer("❌ خطأ أثناء الخصم", show_alert=True)
+    return
+
+if not ok:
+    await q.answer("❌ الرصيد غير كافي", show_alert=True)
+    return
+
+update_order_status(order_id, "completed")
+print(f"[WITHDRAW] uid={cust_uid} amount={amount}")
+
+    old = q.message.caption or q.message.text or ""
+    new_cap = old + f"\n\n✅ <b>تم التأكيد بواسطة الأدمن</b>"
+
+    try:
+        if q.message.caption:
+            await q.edit_message_caption(new_cap, parse_mode="HTML")
+        else:
+            await q.edit_message_text(new_cap, parse_mode="HTML")
+    except Exception:
+        pass
+
+    try:
+        await ctx.bot.send_message(
+            cust_uid,
+            f"✅ <b>تم تأكيد تحويلك!</b>\n\n"
+            f"📋 رقم الطلب: <code>#{order_id}</code>\n"
+            f"⚙️ جاري تنفيذ الخدمة الآن، شكراً لثقتك! 🙏",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+
+
+async def dp_admin_reject(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """الأدمن يرفض التحويل."""
+    q = update.callback_query
+    await q.answer("❌ تم الرفض")
+
+    _, _, oid_s, cuid_s = q.data.split("_", 3)
+    order_id = int(oid_s)
+    cust_uid = int(cuid_s)
+
+    update_order_status(order_id, "cancelled")
+
+    old = q.message.caption or q.message.text or ""
+    new_cap = old + f"\n\n❌ <b>تم الرفض بواسطة الأدمن</b>"
+
+    try:
+        if q.message.caption:
+            await q.edit_message_caption(new_cap, parse_mode="HTML")
+        else:
+            await q.edit_message_text(new_cap, parse_mode="HTML")
+    except Exception:
+        pass
+
+    try:
+        await ctx.bot.send_message(
+            cust_uid,
+            f"❌ <b>تم رفض التحويل</b>\n\n"
+            f"📋 رقم الطلب: <code>#{order_id}</code>\n"
+            f"يرجى التواصل مع الدعم للاستفسار.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🛟 الدعم", callback_data="support")],
+            ]),
+        )
+    except Exception:
+        pass
+
+
+# ════════════════════════════════════════════════════
+#  تسجيل المعالجات
+# ════════════════════════════════════════════════════
+
+direct_pay_conv = ConversationHandler(
+    entry_points=[
+        CallbackQueryHandler(direct_pay_start, pattern="^direct_pay$"),
+    ],
+    states={
+        DP_COUNTRY: [
+            CallbackQueryHandler(dp_country,       pattern=r"^dp_ctr_"),
+            CallbackQueryHandler(dp_back_to_source, pattern="^back_to_dp_src$"),
+            CallbackQueryHandler(direct_pay_start,  pattern="^direct_pay$"),
+        ],
+        DP_METHOD: [
+            CallbackQueryHandler(dp_method,         pattern=r"^dp_method_"),
+            CallbackQueryHandler(dp_country,        pattern=r"^dp_ctr_"),
+            CallbackQueryHandler(direct_pay_start,  pattern="^direct_pay$"),
+        ],
+        DP_RECEIPT: [
+            MessageHandler(
+                filters.PHOTO | filters.Document.IMAGE,
+                dp_receipt,
+            ),
+            CallbackQueryHandler(dp_country, pattern=r"^dp_ctr_"),
+            CallbackQueryHandler(direct_pay_start, pattern="^direct_pay$"),
+        ],
+    },
+    fallbacks=[
+        CallbackQueryHandler(dp_back_to_source, pattern="^back_to_dp_src$"),
+    ],
+    allow_reentry=True,
+    name="direct_pay_conv",
+)
+
+dp_confirm_handler = CallbackQueryHandler(dp_admin_confirm, pattern=r"^dp_ok_\d+_\d+$")
+dp_reject_handler  = CallbackQueryHandler(dp_admin_reject,  pattern=r"^dp_no_\d+_\d+$")
